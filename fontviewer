@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+#
+# fontviewer
+# Paul Carman 2023 (fix it).
+# Credit: https://github.com/sdushantha/fontpreview (use fuzzy finder)
+# Credit: https://bit.ly/2UvLVhM (use imagemagick).
+
+set -a # export all variables and functions (fzf uses self)
+set -e # exit if any untested error happens (avoid with || true)
+set -f # does not use wildcards in parameters
+
+Err() { # DESC
+   >&2 printf '%s\n' "!!! ${BASH_SOURCE[0]}: ${1:-Error}"
+   [[ 1 -lt "$#" ]] && >&2 printf '  %s\n' "${@:2}"
+   exit 1
+}
+
+# Checkig if needed dependencies are installed
+for dependency in convert fzf sxiv xdotool; do
+   type -p "$dependency" &>/dev/null \
+      && continue
+   Err "Could not find command (package) $dependency" >&2
+done
+
+VERSION=2.0
+
+# Default values
+PROMPT="❯ " # fuzzy finder prompt
+SEPARATOR=' <- ' # separator to use in list (must be unique compared to font name)
+SIZE='530x680' # image size
+LOCATION="-0+0" # image location
+POINTS=38 # font size in points
+BG_COLOR="#ffffff" # image background color
+FG_COLOR="#000000" # image foreground color
+TEXT="ABCDEFGHIJKLM\nNOPQRSTUVWXYZ\nabcdefghijklm\nnopqrstuvwxyz\n1234567890\n!@$\%(){}[]" # image text
+
+# Create a place where the preview image will be stored
+TMP_PREFIX="${TMPDIR:-/tmp}/$(basename -- "${BASH_SOURCE[0]}").$$."
+OUTPUT="$(mktemp "${TMP_PREFIX}XXX.png")"
+
+Help() {
+   cat - <<-EOF
+usage: fontviewer ARGUMENT | FILE ...
+┌─┐┌─┐┌┐┌┌┬┐┬  ┬┬┌─┐┬ ┬┌─┐┬─┐
+├┤ │ ││││ │ └┐┌┘│├┤ │││├┤ ├┬┘
+└  └─┘┘└┘ ┴  └┘ ┴└─┘└┴┘└─┘┴└─
+Minimalistic font viewer written in bash
+
+Press [Space] to view currently selected font.
+
+optional arguments:
+  -?|-help                     show this help message and exit
+  -b|-bg-color #RRBBGG         viewer background color
+  -c|-fg-color #RRBBGG         viewer foreground color
+  -f|-font-size POINTS         font size to use in viewer image
+  -l|-view-location +/-DX+/-DY viewer window position (negative from bottom/right)
+  -o|-zOutput FILE              zOutput filename of viewer image
+  -p|-search-prompt PROMPT     input prompt of fuzzy searcher
+  -s|-image-size XxY font      image size
+  -t|-image-text TEXT          image text displayed in the font
+  -V|-version                  show fontviewer version and exit
+  FONT ...                     view font, even if not installed
+Note: See source to for many available option abbreviations.
+EOF
+}
+
+color_format='#[[:xdigit:]]{6}' # =~ requirement for color spec
+location_format='[+-][0-9][+-][0-9]+' # =~ requirement for viewer location
+size_format='[0-9]+x[0-9]+' # =~ requirement for image size
+
+trap PreExit EXIT
+
+# Save window ID of the terminal fontpreview is executed in.
+# After viewer is opened, the focus is given back to self
+# so that the user can immediately continue to search for fonts.
+SELF="$(xdotool getactivewindow)"
+
+# need to track process id of vieweer
+# stored in a file so that it can be output from a child process
+VIEWER="${TMPDIR:-/tmp}/$(basename -- "${BASH_SOURCE[0]}").$$.viewer"
+
+KillViewer() {
+   [[ -e "$VIEWER" ]] || return 0
+   local id
+   id="$(cat "$VIEWER")"
+   kill "$id" &>/dev/null || true
+   wait "$id" &>/dev/null || true # kill remaining zombie
+   rm "$VIEWER"
+}
+
+PreExit() { # @see trap
+   KillViewer
+   rm -f "$VIEWER" # delete temporary files
+}
+
+SelfIsFront() { # is self the active window?
+   [[ "$(xdotool getactivewindow)" = "$SELF" ]]
+}
+
+ViewerIsRunning() {
+   [[ -e "$VIEWER" ]] || return 1
+   local id
+   id="$(cat "$VIEWER")"
+   [[ Z != "$(ps --no-headers -o s "$id")" ]]
+}
+
+GenerateView() { # NAME[$SEPARATOR[FILE]] [OUTPUT_IMAGE]
+   # Executed by child process fzf when space bar is struck
+   KillViewer
+   [[ "$1" =~ (.*)"$SEPARATOR"(.*) ]]
+   local zFont
+   if [[ "${BASH_REMATCH[2]}" ]]; then
+      # prefer to use filename if provided
+      zFont="${BASH_REMATCH[2]}"
+   else
+      # dashes exist in place of spaces
+      zFont=$(tr ' ' '-' <<< "${BASH_REMATCH[1]}")
+   fi
+   local zOutput="${2:-$OUTPUT}" # assign with default
+   convert -size "$SIZE" \
+           xc:"$BG_COLOR" \
+           -fill "$FG_COLOR" \
+           -font "$zFont" \
+           -gravity center \
+           -pointsize "$POINTS" \
+           -annotate +0+0 "$TEXT" \
+           -flatten "$zOutput" \
+      || Err "Reinstall ghostscript package if unable to convert"
+   sxiv -b -g "$SIZE$LOCATION" "$zOutput" &
+   echo $! > "$VIEWER" # record the disowned process id
+   # wait for viewer to open its window
+   timeout 3 bash -c "while ViewerIsRunning && SelfIsFront; do :; done"
+   if ViewerIsRunning &>/dev/null; then
+      # Change focus back to self (leaving viewer on top)
+      xdotool windowfocus "$SELF"
+   else
+      wait "$(cat "$VIEWER")"
+      Err "Viewer exited with code $?"
+   fi
+}
+
+dofzf=t # if FONT on command line, then we don't fuzzy find
+dashdash= # has -- argument been found?
+while [[ 0 -ne "$#" ]]; do # parse arguments
+   if [[ "$dashdash" || '-' != "${1:0:1}" ]]; then
+      # display font file specified on command line
+      if [[ -f "$font" ]]; then
+         GenerateView "$font" "$OUTPUT"
+         dofzf= # flag to skip fuzzy finder menu
+      else
+         Err "# ${BASH_SOURCE[0]}: No font at $1"
+      fi
+   else
+      # process command line option
+      if [[ "$1" =~ ^-(?|h(elp)?)$ ]]; then
+         Help
+         exit
+      elif [[ "$1" =~ ^-b(g(-color)?)?(=.*)? ]]; then
+         if [[ "${BASH_REMATCH[3]}" ]]; then
+            BG_COLOR="${BASH_REMATCH[3]:1}"
+         else
+            BG_COLOR="$2"
+            shift
+         fi
+         [[ "$BG_COLOR" =~ ^$color_format$ ]] \
+            || Err "Did not find background color specification matching regex $color_format."
+      elif [[ "$1" =~ ^(-fg)?-c(olor)?(=.*)? ]]; then
+         if [[ "${BASH_REMATCH[3]}" ]]; then
+            FG_COLOR="${BASH_REMATCH[3]:1}"
+         else
+            FG_COLOR="$2"
+            shift
+         fi
+         [[ "$FG_COLOR" =~ ^$color_format$ ]] \
+            || Err "Did not find foreground color specification matching regex $color_format."
+      elif [[ "$1" =~ ^-f(ont(-size)?)?(=.*)? ]]; then
+         POINTS="${BASH_REMATCH[3]:1}"
+         [[ "$POINTS" ]] || { POINTS="$2"; shift; }
+      elif [[ "$1" =~ ^-(v(iew)?)?-?l(oc(action)?)?(=.*)? ]]; then
+         if [[ "${BASH_REMATCH[5]}" ]]; then
+            LOCATION="${BASH_REMATCH[5]:1}"
+         else
+            LOCATION="$2"
+            shift
+         fi
+         [[ "$LOCATION" =~ ^$location_format$ ]] \
+            || Err "Did not find view location specification matching regex $location_format."
+      elif [[ "$1" =~ ^-o(ut(put)?)?(=.*)? ]]; then
+         if [[ "${BASH_REMATCH[3]}" ]]; then
+            OUTPUT="${BASH_REMATCH[3]:1}"
+         else
+            OUTPUT="$2"
+            shift
+         fi
+      elif [[ "$1" =~ ^-(s(search)?)?-?p(promt)?(=.*)? ]]; then
+         if [[ "${BASH_REMATCH[4]}" ]]; then
+            PROMPT="${BASH_REMATCH[4]:1}"
+         else
+            PROMPT="$2"
+            shift
+         fi
+      elif [[ "$1" =~ ^-(v(iew)?)?-?s(ize)?(=.*)?$ ]]; then
+         if [[ "${BASH_REMATCH[4]}" ]]; then
+            SIZE="${BASH_REMATCH[4]:1}"
+         else
+            SIZE="$2"
+            shift
+         fi
+         [[ "$SIZE" =~ ^$size_format$ ]] \
+            || Err "Did not find view size specification matching regex $size_format."
+      elif [[ "$1" =~ ^-(i(mage)?)?-?t(ext)?(=.*)? ]]; then
+         if [[ "${BASH_REMATCH[4]}" ]]; then
+            TEXT="${BASH_REMATCH[4]:1}"
+         else
+            TEXT="$2"
+            shift
+         fi
+      elif [[ "$1" =~ ^-(V|version)$ ]]; then
+         echo $VERSION
+         exit
+      elif [[ "$1" == '--' ]]; then
+         dashdash=t
+      else
+         Err "Unknown option $1"
+      fi
+   fi
+   shift
+done
+
+[[ "$dofzf" ]] || exit 0
+#fzf --bind 'Return:execute(GenerateView {})' # require use of return key
+fzf --preview 'GenerateView {}' \
+    --prompt="$PROMPT" \
+    --scroll-off=5 \
+    < <(fc-list --format "%{fullname[0]}$SEPARATOR%{file[0]}\n" \
+           | sort -V)
+#    < <(fc-list --format "%{fullname[0]}$SEPARATOR%{file[0]}\n" \
+# convert -list font # creates names with dashes
+# convert -font # wants actual filename or name with dashes
+# fc-list creates names with spaces
+#    < <(convert -list font \
+#           | sed -nE 's/^[[:space:]]*(Font:|glyphs:) //p' \
+#           | sed -nE "N ; s/\n/$SEPARATOR/p" \
